@@ -289,7 +289,7 @@ func (c *Config) openConnector(logger log.Logger) (*ldapConnector, error) {
 	if !ok {
 		return nil, fmt.Errorf("groupSearch.Scope unknown value %q", c.GroupSearch.Scope)
 	}
-	return &ldapConnector{*c, userSearchScope, groupSearchScope, tlsConfig, logger, "", []byte{} }, nil
+	return &ldapConnector{*c, userSearchScope, groupSearchScope, tlsConfig, logger, "", []byte{}}, nil
 }
 
 type ldapConnector struct {
