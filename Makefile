@@ -16,7 +16,7 @@ group=$(shell id -g -n)
 
 export GOBIN=$(PWD)/bin
 
-LD_FLAGS="-w -X $(REPO_PATH)/version.Version=$(VERSION)"
+LD_FLAGS="$(LDFLAGS) -w -X $(REPO_PATH)/version.Version=$(VERSION)"
 
 build: bin/dex bin/example-app bin/grpc-client
 
@@ -78,6 +78,9 @@ bin/golint:
 
 clean:
 	@rm -rf bin/
+
+rpm: FORCE
+	tito build --rpm --test
 
 testall: testrace vet fmt lint
 
