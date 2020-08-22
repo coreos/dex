@@ -76,6 +76,10 @@ func serve(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if len(c.PublicURL) == 0 {
+		c.PublicURL = c.Issuer
+	}
+
 	logger.Infof("config issuer: %s", c.Issuer)
 
 	prometheusRegistry := prometheus.NewRegistry()
@@ -239,6 +243,7 @@ func serve(cmd *cobra.Command, args []string) error {
 		PasswordConnector:      c.OAuth2.PasswordConnector,
 		AllowedOrigins:         c.Web.AllowedOrigins,
 		Issuer:                 c.Issuer,
+		PublicURL:              c.PublicURL,
 		Storage:                s,
 		Web:                    c.Frontend,
 		Logger:                 logger,
