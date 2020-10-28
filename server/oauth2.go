@@ -16,11 +16,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	jose "gopkg.in/square/go-jose.v2"
+
+	lru "github.com/hashicorp/golang-lru"
 
 	"github.com/dexidp/dex/connector"
 	"github.com/dexidp/dex/server/internal"
@@ -440,7 +443,7 @@ func (s *Server) parseAuthorizationRequest(r *http.Request) (*storage.AuthReques
 		}
 	}
 
-	if !validateRedirectURI(client, redirectURI) {
+	if !validateRedirectURI(client, s.wildcardMatcherCache, redirectURI) {
 		description := fmt.Sprintf("Unregistered redirect_uri (%q).", redirectURI)
 		return nil, &authErr{"", "", errInvalidRequest, description}
 	}
@@ -587,11 +590,22 @@ func (s *Server) validateCrossClientTrust(clientID, peerID string) (trusted bool
 	return false, nil
 }
 
-func validateRedirectURI(client storage.Client, redirectURI string) bool {
+func validateRedirectURI(client storage.Client, wildcardCache *lru.ARCCache, redirectURI string) bool {
 	if !client.Public {
 		for _, uri := range client.RedirectURIs {
 			if redirectURI == uri {
+				// exact match is valid
 				return true
+			}
+
+			if urlRequested, err := url.Parse(redirectURI); err == nil && urlRequested != nil {
+				// validly-formed url
+				clobberMatcher := getClobberHostMatcher(uri, wildcardCache)
+				validClobber := clobberMatcher.HostMatcher != nil && clobberMatcher.ClientRedirectURL != nil
+				if validClobber && matchesClobber(clobberMatcher, urlRequested) {
+					// clobber match success
+					return true
+				}
 			}
 		}
 		return false
@@ -606,7 +620,8 @@ func validateRedirectURI(client storage.Client, redirectURI string) bool {
 	if err != nil {
 		return false
 	}
-	if u.Scheme != "http" {
+	// public clients should use http or https (#1300)
+	if u.Scheme != "http" && u.Scheme != "https" {
 		return false
 	}
 	if u.Host == "localhost" {
@@ -614,6 +629,108 @@ func validateRedirectURI(client storage.Client, redirectURI string) bool {
 	}
 	host, _, err := net.SplitHostPort(u.Host)
 	return err == nil && host == "localhost"
+}
+
+func matchesClobber(clobberMatcher ClientRedirectClobberMatcher, urlRequested *url.URL) bool {
+	if clobberMatcher.ClientRedirectURL.Path != urlRequested.Path {
+		// failed path match
+		return false
+	}
+	if clobberMatcher.ClientRedirectURL.Scheme != urlRequested.Scheme {
+		// failed scheme match
+		return false
+	}
+	if !clobberMatcher.HostMatcher.MatchString(urlRequested.Host) {
+		// failed host match
+		return false
+	}
+	return true
+}
+
+type HostSplit struct {
+	HostSuffix      string // e.g.  host:port of two closest root domains e.g. example.com:8888
+	SubDomainPrefix string // e.g.  dom.abc (from dom.abc.example.com)
+}
+
+type ClientRedirectClobberMatcher struct {
+	ClientRedirectURL *url.URL
+	HostMatcher       *regexp.Regexp
+}
+
+// Returns a clobber/wildcard subdomain matcher struct
+func createClientRedirectClobberMatcher(clientRedirectURI string) ClientRedirectClobberMatcher {
+	redirectURL, _ := url.Parse(clientRedirectURI)
+	if redirectURL == nil {
+		return ClientRedirectClobberMatcher{}
+	}
+	splitResult := splitClobberHTTPRedirectURL(redirectURL)
+	if splitResult == nil {
+		// not wildcard or invalid
+		return ClientRedirectClobberMatcher{}
+	}
+
+	// first replace double-asterisk globber with .+
+	var subdomain = strings.ReplaceAll(regexp.QuoteMeta(splitResult.SubDomainPrefix), "\\*\\*", ".+")
+	subdomain = strings.ReplaceAll(subdomain, "\\*", "[^.]+")
+
+	hostNameRegExStr := "^" + subdomain + "\\." + regexp.QuoteMeta(splitResult.HostSuffix) + "$"
+
+	hostNameRegEx, err := regexp.Compile(hostNameRegExStr)
+	if err != nil {
+		// bad pattern - unexpected
+		return ClientRedirectClobberMatcher{}
+	}
+
+	return ClientRedirectClobberMatcher{
+		ClientRedirectURL: redirectURL,
+		HostMatcher:       hostNameRegEx,
+	}
+}
+
+// extract the scheme, host and path for wildcard checks.
+// If the scheme is not http or https, or does not specify an absolute path beginning with '/'
+// the parser will return nil.
+func splitClobberHTTPRedirectURL(clientRedirectURLSpec *url.URL) *HostSplit {
+	host := clientRedirectURLSpec.Host
+	if !strings.Contains(host, "*") {
+		// for efficiency, check wildcard before DomainComponents
+		return nil
+	}
+
+	if strings.Contains(host, "***") {
+		// a maximum of 2 '*' characters are permitted in sequence
+		return nil
+	}
+
+	// sub-domain portion is first portion (greedy)
+	hostSplit := regexp.MustCompile(`^(.+)\.([^.]*[A-Za-z][^.]*\.[^.]*[A-Za-z][^.]+)$`)
+	hostRes := hostSplit.FindStringSubmatch(host)
+	if hostRes == nil {
+		// does not conform to requirements of a subdomain spec followed by two higher order domains
+		return nil
+	}
+
+	return &HostSplit{
+		HostSuffix:      hostRes[2],
+		SubDomainPrefix: hostRes[1],
+	}
+}
+
+func getClobberHostMatcher(clientRedirectURI string, wildcardCache *lru.ARCCache) ClientRedirectClobberMatcher {
+	if wildcardCache == nil {
+		// unexpected error condition where cache is unavailable
+		return ClientRedirectClobberMatcher{}
+	}
+
+	if redirectMatcherStruct, ok := wildcardCache.Get(clientRedirectURI); ok {
+		// cache hit
+		return redirectMatcherStruct.(ClientRedirectClobberMatcher)
+	}
+	// cache miss - calc and add to cache
+	calcResult := createClientRedirectClobberMatcher(clientRedirectURI)
+	wildcardCache.Add(clientRedirectURI, calcResult)
+	// return cached result
+	return calcResult
 }
 
 func validateConnectorID(connectors []storage.Connector, connectorID string) bool {

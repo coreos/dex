@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	lru "github.com/hashicorp/golang-lru"
+	"github.com/stretchr/testify/assert"
 	"gopkg.in/square/go-jose.v2"
 
 	"github.com/dexidp/dex/storage"
@@ -322,6 +324,69 @@ func TestAccessTokenHash(t *testing.T) {
 	}
 }
 
+func TestSplitHttpRedirectUrl(t *testing.T) {
+	//  if strings.Index(clientRedirectUrlSpec, "*") == -1 {
+	//  no wildcard characters to consider
+	//  return nil
+	//}
+
+	tests := []struct {
+		redirectURI     string
+		expectValid     bool
+		expectHostSplit *HostSplit
+	}{
+		{
+			redirectURI: "http://*.example.com/%23267#222",
+			expectValid: true,
+			expectHostSplit: &HostSplit{
+				HostSuffix:      "example.com",
+				SubDomainPrefix: "*",
+			},
+		},
+		{
+			// ip addresses cannot
+			redirectURI: "http://1.2.3.4/",
+			expectValid: false,
+		},
+		{
+			// cannot act on top-level domain
+			redirectURI: "http://*.com/",
+			expectValid: false,
+		},
+		{
+			// no wildcard
+			redirectURI: "http://example.com/",
+			expectValid: false,
+		},
+		{
+			redirectURI: "http://1.2.3.4",
+			expectValid: false, // no trailing slash
+		},
+		{
+			// ipv6 address not used for wildcard (dns only)
+			redirectURI: "https://[fdda:5cc1:23:4::1f]/foo",
+			expectValid: false,
+		},
+	}
+
+	tAssert := assert.New(t)
+	for _, test := range tests {
+		testRedirectURL, err := url.Parse(test.redirectURI)
+		tAssert.Nilf(err, "Invalid test url %v", test.redirectURI)
+		tAssert.NotNilf(testRedirectURL, "Invalid test url %v", test.redirectURI)
+		result := splitClobberHTTPRedirectURL(testRedirectURL)
+		tAssert.Equal(test.expectValid, result != nil, "Valid result expected for %v", test.redirectURI)
+		if test.expectHostSplit != nil {
+			tAssert.Equal(result, test.expectHostSplit, "Host split validation failed for %v", test.redirectURI)
+		}
+		if result != nil {
+			fullResult := createClientRedirectClobberMatcher(test.redirectURI)
+			tAssert.True(fullResult.HostMatcher != nil)
+			tAssert.Equal(fullResult.ClientRedirectURL, testRedirectURL)
+		}
+	}
+}
+
 func TestValidRedirectURI(t *testing.T) {
 	tests := []struct {
 		client      storage.Client
@@ -336,10 +401,197 @@ func TestValidRedirectURI(t *testing.T) {
 			wantValid:   true,
 		},
 		{
+			// invalid schema
+			client: storage.Client{
+				RedirectURIs: []string{"http://foo.com/bar"},
+			},
+			redirectURI: "https://foo.com/bar",
+			wantValid:   false,
+		},
+		{
+			// invalid schema with pattern
+			client: storage.Client{
+				RedirectURIs: []string{"http://*.foo.com/bar"},
+			},
+			redirectURI: "https://test.foo.com/bar",
+			wantValid:   false,
+		},
+		{
+			// check https is valid protocol
+			client: storage.Client{
+				RedirectURIs: []string{"https://foo.com/bar/baz"},
+			},
+			redirectURI: "https://foo.com/bar/baz",
+			wantValid:   true,
+		},
+		{
 			client: storage.Client{
 				RedirectURIs: []string{"http://foo.com/bar"},
 			},
 			redirectURI: "http://foo.com/bar/baz",
+			wantValid:   false,
+		},
+		{
+			// invalid path with pattern
+			client: storage.Client{
+				RedirectURIs: []string{"http://*.foo.com/bar"},
+			},
+			redirectURI: "http://test.foo.com/baz",
+			wantValid:   false,
+		},
+		{
+			client: storage.Client{
+				RedirectURIs: []string{"http://*.foo.com/bar"},
+			},
+			redirectURI: "http://abc.foo.com/bar",
+			wantValid:   true,
+		},
+		{
+			client: storage.Client{
+				RedirectURIs: []string{"http://abc.foo.com/bar"},
+			},
+			redirectURI: "http://abc.foo.com/bar",
+			wantValid:   true,
+		},
+		{
+			client: storage.Client{
+				RedirectURIs: []string{"http://b*.foo.com/bar"},
+			},
+			redirectURI: "http://abc.foo.com/bar",
+			wantValid:   false,
+		},
+		{
+			client: storage.Client{
+				RedirectURIs: []string{"http://b*.foo.com/bar"},
+			},
+			redirectURI: "http://b.foo.com/bar",
+			wantValid:   false,
+		},
+		{
+			client: storage.Client{
+				RedirectURIs: []string{"http://b*.foo.com/bar"},
+			},
+			redirectURI: "http://bar.foo.com/bar",
+			wantValid:   true,
+		},
+		{
+			// URL must use http: or https: protocol
+			client: storage.Client{
+				RedirectURIs: []string{"unknown://*.foo.com/bar"},
+			},
+			redirectURI: "unknown://abc.foo.com/bar",
+			wantValid:   true,
+		},
+		{
+			// wildcard can be located in subdomain as long as not in top two domains
+			//  https://abc.*.foo.com ok.
+			client: storage.Client{
+				RedirectURIs: []string{"http://abc.*.foo.com/bar"},
+			},
+			redirectURI: "http://abc.123.foo.com/bar",
+			wantValid:   true,
+		},
+		{
+			client: storage.Client{
+				RedirectURIs: []string{"http://**.foo.com/bar"},
+			},
+			redirectURI: "http://abc.123.foo.com/bar",
+			wantValid:   true,
+		},
+		{
+			client: storage.Client{
+				RedirectURIs: []string{"http://**.foo.com/bar"},
+			},
+			redirectURI: "http://test.foo.com/bar",
+			wantValid:   true,
+		},
+		{
+			client: storage.Client{
+				RedirectURIs: []string{"http://a**.foo.com/bar"},
+			},
+			redirectURI: "http://abc.123.foo.com/bar",
+			wantValid:   true,
+		},
+		{
+			client: storage.Client{
+				RedirectURIs: []string{"http://a**.foo.com/bar"},
+			},
+			redirectURI: "http://a.foo.com/bar",
+			wantValid:   false,
+		},
+		{
+			// wildcard may be prefixed and/or suffixed with additional valid hostname characters
+			//  https://pre-*-post.foo.com will work
+			client: storage.Client{
+				RedirectURIs: []string{"http://pre-*-post.foo.com/bar"},
+			},
+			redirectURI: "http://pre-dinner-post.foo.com/bar",
+			wantValid:   true,
+		},
+		{
+			// valid wildcard will not match a URL more than one subdomain level in place of the wildcard
+			//  https://*.foo.com will not work with https://123.abc.foo.com.
+			client: storage.Client{
+				RedirectURIs: []string{"https://*.foo.com/"},
+			},
+			redirectURI: "https://123.abc.foo.com/",
+			wantValid:   false,
+		},
+		{
+			// check escaping
+			client: storage.Client{
+				RedirectURIs: []string{"https://*.foo.com/"},
+			},
+			redirectURI: "https://abc.foo0com/",
+			wantValid:   false,
+		},
+		{
+			// with port
+			client: storage.Client{
+				RedirectURIs: []string{"http://*.sld.com:6000/path"},
+			},
+			redirectURI: "http://test.sld.com:6000/path",
+			wantValid:   true,
+		},
+		{
+			// negative logic with port
+			client: storage.Client{
+				RedirectURIs: []string{"http://*.sld.com:6000/path"},
+			},
+			redirectURI: "http://test.sld.com/path",
+			wantValid:   false,
+		},
+		{
+			// wildcard must be located in a subdomain within a hostname component.  http://*.com is not permitted.
+			client: storage.Client{
+				RedirectURIs: []string{"http://*.*.com/bar"},
+			},
+			redirectURI: "http://test.foo.com/bar",
+			wantValid:   false,
+		},
+		{
+			// partial wildcard in SLD is prohibited
+			client: storage.Client{
+				RedirectURIs: []string{"http://*.foo*.com/bar"},
+			},
+			redirectURI: "http://test.foo.com/bar",
+			wantValid:   false,
+		},
+		{
+			// wildcard in TLD is prohibited
+			client: storage.Client{
+				RedirectURIs: []string{"http://*.example.*/bar"},
+			},
+			redirectURI: "http://test.foo.com/bar",
+			wantValid:   false,
+		},
+		{
+			// partial wildcard in TLD is prohibited
+			client: storage.Client{
+				RedirectURIs: []string{"http://*.example.io*/bar"},
+			},
+			redirectURI: "http://test.foo.com/bar",
+			wantValid:   false,
 		},
 		{
 			client: storage.Client{
@@ -363,6 +615,14 @@ func TestValidRedirectURI(t *testing.T) {
 			wantValid:   true,
 		},
 		{
+			// github.com/dexidp/dex/issues/1300 allow public redirect URLs
+			client: storage.Client{
+				Public: true,
+			},
+			redirectURI: "https://localhost",
+			wantValid:   true,
+		},
+		{
 			client: storage.Client{
 				Public: true,
 			},
@@ -377,12 +637,21 @@ func TestValidRedirectURI(t *testing.T) {
 			wantValid:   false,
 		},
 	}
+
+	maxCacheSize := 3
+	wildcardCache, _ := lru.NewARC(maxCacheSize)
+
 	for _, test := range tests {
-		got := validateRedirectURI(test.client, test.redirectURI)
+		got := validateRedirectURI(test.client, wildcardCache, test.redirectURI)
 		if got != test.wantValid {
 			t.Errorf("client=%#v, redirectURI=%q, wanted valid=%t, got=%t",
 				test.client, test.redirectURI, test.wantValid, got)
 		}
+	}
+
+	if wildcardCache.Len() == 0 {
+		// check eviction policed
+		t.Errorf("cache should be in use")
 	}
 }
 
