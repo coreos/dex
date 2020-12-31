@@ -94,6 +94,12 @@ func (p *password) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &data); err != nil {
 		return err
 	}
+
+	// Replace environment variables
+	//if err := replaceEnvKeys(&data, os.Getenv); err != nil {
+	//	return fmt.Errorf("replacing environment keys: %v", err)
+	//}
+
 	*p = password(storage.Password{
 		Email:    data.Email,
 		Username: data.Username,
@@ -191,6 +197,12 @@ func (s *Storage) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &store); err != nil {
 		return fmt.Errorf("parse storage: %v", err)
 	}
+
+	// Replace environment variables
+	if err := replaceEnvKeys(&store, os.Getenv); err != nil {
+		return fmt.Errorf("replacing environment keys: %v", err)
+	}
+
 	f, ok := storages[store.Type]
 	if !ok {
 		return fmt.Errorf("unknown storage type %q", store.Type)
@@ -198,9 +210,13 @@ func (s *Storage) UnmarshalJSON(b []byte) error {
 
 	storageConfig := f()
 	if len(store.Config) != 0 {
-		data := []byte(os.ExpandEnv(string(store.Config)))
-		if err := json.Unmarshal(data, storageConfig); err != nil {
+		if err := json.Unmarshal(store.Config, storageConfig); err != nil {
 			return fmt.Errorf("parse storage config: %v", err)
+		}
+
+		// Replace environment variables
+		if err := replaceEnvKeys(storageConfig, os.Getenv); err != nil {
+			return fmt.Errorf("replacing environment keys: %v", err)
 		}
 	}
 	*s = Storage{
@@ -233,6 +249,11 @@ func (c *Connector) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &conn); err != nil {
 		return fmt.Errorf("parse connector: %v", err)
 	}
+
+	// Replace environment variables
+	if err := replaceEnvKeys(&conn, os.Getenv); err != nil {
+		return fmt.Errorf("replacing environment keys: %v", err)
+	}
 	f, ok := server.ConnectorsConfig[conn.Type]
 	if !ok {
 		return fmt.Errorf("unknown connector type %q", conn.Type)
@@ -240,9 +261,13 @@ func (c *Connector) UnmarshalJSON(b []byte) error {
 
 	connConfig := f()
 	if len(conn.Config) != 0 {
-		data := []byte(os.ExpandEnv(string(conn.Config)))
-		if err := json.Unmarshal(data, connConfig); err != nil {
+		if err := json.Unmarshal(conn.Config, connConfig); err != nil {
 			return fmt.Errorf("parse connector config: %v", err)
+		}
+
+		// Replace environment variables
+		if err := replaceEnvKeys(connConfig, os.Getenv); err != nil {
+			return fmt.Errorf("replacing environment keys: %v", err)
 		}
 	}
 	*c = Connector{
