@@ -274,4 +274,30 @@ var migrations = []migration{
 				add column code_challenge_method text not null default '';`,
 		},
 	},
+	{
+		stmts: []string{
+			`
+            create table middleware (
+				conn_id text not null,
+				mw_order integer not null,
+                type text not null,
+                resource_version text not null,
+                config bytea,
+				PRIMARY KEY (conn_id, mw_order)
+            );`,
+		},
+	},
+	{
+		stmts: []string{
+			`
+			alter table auth_request
+				add column claims_custom bytea;`,
+			`
+			alter table auth_code
+				add column claims_custom bytea;`,
+			`
+			alter table refresh_token
+				add column claims_custom bytea;`,
+		},
+	},
 }

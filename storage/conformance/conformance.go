@@ -45,6 +45,7 @@ func RunTests(t *testing.T, newStorage func() storage.Storage) {
 		{"KeysCRUD", testKeysCRUD},
 		{"OfflineSessionCRUD", testOfflineSessionCRUD},
 		{"ConnectorCRUD", testConnectorCRUD},
+		{"MiddlewareCRUD", testMiddlewareCRUD},
 		{"GarbageCollection", testGC},
 		{"TimezoneSupport", testTimezones},
 		{"DeviceRequestCRUD", testDeviceRequestCRUD},
@@ -78,6 +79,15 @@ func mustBeErrAlreadyExists(t *testing.T, kind string, err error) {
 	}
 }
 
+func mustBeErrOutOfRange(t *testing.T, kind string, err error) {
+	switch {
+	case err == nil:
+		t.Errorf("expected ErrOutOfRange, got nil. (kind %q)", kind)
+	case err != storage.ErrOutOfRange:
+		t.Errorf("expected ErrOutOfRange, got %v. (kind %q)", kind, err)
+	}
+}
+
 func testAuthRequestCRUD(t *testing.T, s storage.Storage) {
 	codeChallenge := storage.PKCE{
 		CodeChallenge:       "code_challenge_test",
@@ -103,6 +113,7 @@ func testAuthRequestCRUD(t *testing.T, s storage.Storage) {
 			Email:         "jane.doe@example.com",
 			EmailVerified: true,
 			Groups:        []string{"a", "b"},
+			Custom:        map[string]interface{}{"foo": "bar"},
 		},
 		PKCE: codeChallenge,
 	}
@@ -136,6 +147,7 @@ func testAuthRequestCRUD(t *testing.T, s storage.Storage) {
 			Email:         "john.doe@example.com",
 			EmailVerified: true,
 			Groups:        []string{"a"},
+			Custom:        map[string]interface{}{"yes": "no"},
 		},
 	}
 
@@ -195,6 +207,7 @@ func testAuthCodeCRUD(t *testing.T, s storage.Storage) {
 			Email:         "jane.doe@example.com",
 			EmailVerified: true,
 			Groups:        []string{"a", "b"},
+			Custom:        map[string]interface{}{"foo": "bar"},
 		},
 	}
 
@@ -217,6 +230,7 @@ func testAuthCodeCRUD(t *testing.T, s storage.Storage) {
 			Email:         "john.doe@example.com",
 			EmailVerified: true,
 			Groups:        []string{"a"},
+			Custom:        map[string]interface{}{"yes": "no"},
 		},
 	}
 
@@ -338,6 +352,7 @@ func testRefreshTokenCRUD(t *testing.T, s storage.Storage) {
 			Email:         "jane.doe@example.com",
 			EmailVerified: true,
 			Groups:        []string{"a", "b"},
+			Custom:        map[string]interface{}{"foo": "bar"},
 		},
 		ConnectorData: []byte(`{"some":"data"}`),
 	}
@@ -392,6 +407,7 @@ func testRefreshTokenCRUD(t *testing.T, s storage.Storage) {
 			Email:         "john.doe@example.com",
 			EmailVerified: true,
 			Groups:        []string{"a", "b"},
+			Custom:        map[string]interface{}{"foo": "bar"},
 		},
 		ConnectorData: []byte(`{"some":"data"}`),
 	}
@@ -689,6 +705,95 @@ func testConnectorCRUD(t *testing.T, s storage.Storage) {
 	mustBeErrNotFound(t, "connector", err)
 }
 
+func testMiddlewareCRUD(t *testing.T, s storage.Storage) {
+	emptyConfig := []byte(`{}`)
+	m1 := storage.Middleware{
+		Type:   "groups",
+		Config: emptyConfig,
+	}
+
+	if err := s.InsertMiddleware(0, m1); err != nil {
+		t.Fatalf("insert middleware at start: %v", err)
+	}
+
+	m2 := storage.Middleware{
+		Type:   "groups",
+		Config: emptyConfig,
+	}
+
+	err := s.InsertMiddleware(5, m2)
+	mustBeErrOutOfRange(t, "middleware", err)
+	if err := s.InsertMiddleware(-1, m2); err != nil {
+		t.Fatalf("insert middleware at end: %v", err)
+	}
+
+	m3 := storage.Middleware{
+		Type:   "groups",
+		Config: emptyConfig,
+	}
+
+	if err := s.InsertMiddleware(1, m3); err != nil {
+		t.Fatalf("insert middleware in middle: %v", err)
+	}
+
+	getAndCompare := func(ndx int, want storage.Middleware) {
+		gr, err := s.GetMiddleware(ndx)
+		if err != nil {
+			t.Errorf("get middleware: %v", err)
+			return
+		}
+		// ignore resource version comparison
+		gr.ResourceVersion = ""
+		if diff := pretty.Compare(want, gr); diff != "" {
+			t.Errorf("middleware retrieved from storage did not match: %s", diff)
+		}
+	}
+
+	getAndCompare(0, m1)
+
+	if err := s.UpdateMiddleware(0, func(old storage.Middleware) (storage.Middleware, error) {
+		old.Config = []byte(`{"inject": ["Test"]}`)
+		return old, nil
+	}); err != nil {
+		t.Fatalf("failed to update Middleware: %v", err)
+	}
+
+	m1.Config = []byte(`{"inject": ["Test"]}`)
+	getAndCompare(0, m1)
+
+	middlewareList := []storage.Middleware{m1, m3, m2}
+	listAndCompare := func(want []storage.Middleware) {
+		middlewares, err := s.ListMiddleware()
+		if err != nil {
+			t.Errorf("list middlewares: %v", err)
+			return
+		}
+		// ignore resource version comparison
+		for i := range middlewares {
+			middlewares[i].ResourceVersion = ""
+		}
+		if diff := pretty.Compare(want, middlewares); diff != "" {
+			t.Errorf("middleware list retrieved from storage did not match: %s", diff)
+		}
+	}
+	listAndCompare(middlewareList)
+
+	if err := s.DeleteMiddleware(0); err != nil {
+		t.Fatalf("failed to delete middleware: %v", err)
+	}
+
+	if err := s.DeleteMiddleware(1); err != nil {
+		t.Fatalf("failed to delete middleware: %v", err)
+	}
+
+	if err := s.DeleteMiddleware(0); err != nil {
+		t.Fatalf("failed to delete middleware: %v", err)
+	}
+
+	_, err = s.GetMiddleware(0)
+	mustBeErrOutOfRange(t, "middleware", err)
+}
+
 func testKeysCRUD(t *testing.T, s storage.Storage) {
 	updateAndCompare := func(k storage.Keys) {
 		err := s.UpdateKeys(func(oldKeys storage.Keys) (storage.Keys, error) {
@@ -764,6 +869,7 @@ func testGC(t *testing.T, s storage.Storage) {
 			Email:         "jane.doe@example.com",
 			EmailVerified: true,
 			Groups:        []string{"a", "b"},
+			Custom:        map[string]interface{}{"foo": "bar"},
 		},
 	}
 
@@ -814,6 +920,7 @@ func testGC(t *testing.T, s storage.Storage) {
 			Email:         "jane.doe@example.com",
 			EmailVerified: true,
 			Groups:        []string{"a", "b"},
+			Custom:        map[string]interface{}{"foo": "bar"},
 		},
 	}
 
@@ -944,6 +1051,7 @@ func testTimezones(t *testing.T, s storage.Storage) {
 			Email:         "jane.doe@example.com",
 			EmailVerified: true,
 			Groups:        []string{"a", "b"},
+			Custom:        map[string]interface{}{"foo": "bar"},
 		},
 	}
 	if err := s.CreateAuthCode(c); err != nil {

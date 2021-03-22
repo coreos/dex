@@ -18,6 +18,10 @@ import (
 // keysRowID is the ID of the only row we expect to populate the "keys" table.
 const keysRowID = "keys"
 
+// orderStep says how far apart to space the order values in the global
+// Middleware list
+const orderStep = int64(1024)
+
 // encoder wraps the underlying value in a JSON marshaler which is automatically
 // called by the database/sql package.
 //
@@ -42,6 +46,11 @@ func encoder(i interface{}) driver.Valuer {
 // to a database Scan() method.
 func decoder(i interface{}) sql.Scanner {
 	return jsonDecoder{i}
+}
+
+// defaultDecoder wraps the underlying value in a JSON unmarshaler that allows a default
+func defaultDecoder(i interface{}, defJSON []byte) sql.Scanner {
+	return jsonDefaultDecoder{i, defJSON}
 }
 
 type jsonEncoder struct {
@@ -74,8 +83,28 @@ func (j jsonDecoder) Scan(dest interface{}) error {
 	return nil
 }
 
+type jsonDefaultDecoder struct {
+	i       interface{}
+	defJSON []byte
+}
+
+func (j jsonDefaultDecoder) Scan(dest interface{}) error {
+	if dest == nil {
+		dest = j.defJSON
+	}
+	b, ok := dest.([]byte)
+	if !ok {
+		return fmt.Errorf("expected []byte got %T", dest)
+	}
+	if err := json.Unmarshal(b, &j.i); err != nil {
+		return fmt.Errorf("unmarshal: %v", err)
+	}
+	return nil
+}
+
 // Abstract conn vs trans.
 type querier interface {
+	Query(query string, args ...interface{}) (*sql.Rows, error)
 	QueryRow(query string, args ...interface{}) *sql.Row
 }
 
@@ -128,19 +157,20 @@ func (c *conn) CreateAuthRequest(a storage.AuthRequest) error {
 			id, client_id, response_types, scopes, redirect_uri, nonce, state,
 			force_approval_prompt, logged_in,
 			claims_user_id, claims_username, claims_preferred_username,
-			claims_email, claims_email_verified, claims_groups,
+			claims_email, claims_email_verified, claims_groups, claims_custom,
 			connector_id, connector_data,
 			expiry,
 			code_challenge, code_challenge_method
 		)
 		values (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
 		);
 	`,
 		a.ID, a.ClientID, encoder(a.ResponseTypes), encoder(a.Scopes), a.RedirectURI, a.Nonce, a.State,
 		a.ForceApprovalPrompt, a.LoggedIn,
 		a.Claims.UserID, a.Claims.Username, a.Claims.PreferredUsername,
-		a.Claims.Email, a.Claims.EmailVerified, encoder(a.Claims.Groups),
+		a.Claims.Email, a.Claims.EmailVerified,
+		encoder(a.Claims.Groups), encoder(a.Claims.Custom),
 		a.ConnectorID, a.ConnectorData,
 		a.Expiry,
 		a.PKCE.CodeChallenge, a.PKCE.CodeChallengeMethod,
@@ -172,17 +202,17 @@ func (c *conn) UpdateAuthRequest(id string, updater func(a storage.AuthRequest) 
 				nonce = $5, state = $6, force_approval_prompt = $7, logged_in = $8,
 				claims_user_id = $9, claims_username = $10, claims_preferred_username = $11,
 				claims_email = $12, claims_email_verified = $13,
-				claims_groups = $14,
-				connector_id = $15, connector_data = $16,
-				expiry = $17,
-				code_challenge = $18, code_challenge_method = $19
-			where id = $20;
+				claims_groups = $14, claims_custom = $15,
+				connector_id = $16, connector_data = $17,
+				expiry = $18,
+				code_challenge = $19, code_challenge_method = $20
+			where id = $21;
 		`,
 			a.ClientID, encoder(a.ResponseTypes), encoder(a.Scopes), a.RedirectURI, a.Nonce, a.State,
 			a.ForceApprovalPrompt, a.LoggedIn,
 			a.Claims.UserID, a.Claims.Username, a.Claims.PreferredUsername,
 			a.Claims.Email, a.Claims.EmailVerified,
-			encoder(a.Claims.Groups),
+			encoder(a.Claims.Groups), encoder(a.Claims.Custom),
 			a.ConnectorID, a.ConnectorData,
 			a.Expiry,
 			a.PKCE.CodeChallenge, a.PKCE.CodeChallengeMethod,
@@ -205,7 +235,7 @@ func getAuthRequest(q querier, id string) (a storage.AuthRequest, err error) {
 			id, client_id, response_types, scopes, redirect_uri, nonce, state,
 			force_approval_prompt, logged_in,
 			claims_user_id, claims_username, claims_preferred_username,
-			claims_email, claims_email_verified, claims_groups,
+			claims_email, claims_email_verified, claims_groups, claims_custom,
 			connector_id, connector_data, expiry,
 			code_challenge, code_challenge_method
 		from auth_request where id = $1;
@@ -215,6 +245,7 @@ func getAuthRequest(q querier, id string) (a storage.AuthRequest, err error) {
 		&a.Claims.UserID, &a.Claims.Username, &a.Claims.PreferredUsername,
 		&a.Claims.Email, &a.Claims.EmailVerified,
 		decoder(&a.Claims.Groups),
+		defaultDecoder(&a.Claims.Custom, []byte("{}")),
 		&a.ConnectorID, &a.ConnectorData, &a.Expiry,
 		&a.PKCE.CodeChallenge, &a.PKCE.CodeChallengeMethod,
 	)
@@ -232,16 +263,17 @@ func (c *conn) CreateAuthCode(a storage.AuthCode) error {
 		insert into auth_code (
 			id, client_id, scopes, nonce, redirect_uri,
 			claims_user_id, claims_username, claims_preferred_username,
-			claims_email, claims_email_verified, claims_groups,
+			claims_email, claims_email_verified, claims_groups, claims_custom,
 			connector_id, connector_data,
 			expiry,
 			code_challenge, code_challenge_method
 		)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16);
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17);
 	`,
 		a.ID, a.ClientID, encoder(a.Scopes), a.Nonce, a.RedirectURI, a.Claims.UserID,
 		a.Claims.Username, a.Claims.PreferredUsername, a.Claims.Email, a.Claims.EmailVerified,
-		encoder(a.Claims.Groups), a.ConnectorID, a.ConnectorData, a.Expiry,
+		encoder(a.Claims.Groups), encoder(a.Claims.Custom),
+		a.ConnectorID, a.ConnectorData, a.Expiry,
 		a.PKCE.CodeChallenge, a.PKCE.CodeChallengeMethod,
 	)
 	if err != nil {
@@ -258,7 +290,7 @@ func (c *conn) GetAuthCode(id string) (a storage.AuthCode, err error) {
 		select
 			id, client_id, scopes, nonce, redirect_uri,
 			claims_user_id, claims_username, claims_preferred_username,
-			claims_email, claims_email_verified, claims_groups,
+			claims_email, claims_email_verified, claims_groups, claims_custom,
 			connector_id, connector_data,
 			expiry,
 			code_challenge, code_challenge_method
@@ -266,7 +298,9 @@ func (c *conn) GetAuthCode(id string) (a storage.AuthCode, err error) {
 	`, id).Scan(
 		&a.ID, &a.ClientID, decoder(&a.Scopes), &a.Nonce, &a.RedirectURI, &a.Claims.UserID,
 		&a.Claims.Username, &a.Claims.PreferredUsername, &a.Claims.Email, &a.Claims.EmailVerified,
-		decoder(&a.Claims.Groups), &a.ConnectorID, &a.ConnectorData, &a.Expiry,
+		decoder(&a.Claims.Groups),
+		defaultDecoder(&a.Claims.Custom, []byte("{}")),
+		&a.ConnectorID, &a.ConnectorData, &a.Expiry,
 		&a.PKCE.CodeChallenge, &a.PKCE.CodeChallengeMethod,
 	)
 	if err != nil {
@@ -283,16 +317,16 @@ func (c *conn) CreateRefresh(r storage.RefreshToken) error {
 		insert into refresh_token (
 			id, client_id, scopes, nonce,
 			claims_user_id, claims_username, claims_preferred_username,
-			claims_email, claims_email_verified, claims_groups,
+			claims_email, claims_email_verified, claims_groups, claims_custom,
 			connector_id, connector_data,
 			token, created_at, last_used
 		)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15);
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16);
 	`,
 		r.ID, r.ClientID, encoder(r.Scopes), r.Nonce,
 		r.Claims.UserID, r.Claims.Username, r.Claims.PreferredUsername,
 		r.Claims.Email, r.Claims.EmailVerified,
-		encoder(r.Claims.Groups),
+		encoder(r.Claims.Groups), encoder(r.Claims.Custom),
 		r.ConnectorID, r.ConnectorData,
 		r.Token, r.CreatedAt, r.LastUsed,
 	)
@@ -326,18 +360,19 @@ func (c *conn) UpdateRefreshToken(id string, updater func(old storage.RefreshTok
 				claims_email = $7,
 				claims_email_verified = $8,
 				claims_groups = $9,
-				connector_id = $10,
-				connector_data = $11,
-				token = $12,
-				created_at = $13,
-				last_used = $14
+				claims_custom = $10,
+				connector_id = $11,
+				connector_data = $12,
+				token = $13,
+				created_at = $14,
+				last_used = $15
 			where
-				id = $15
+				id = $16
 		`,
 			r.ClientID, encoder(r.Scopes), r.Nonce,
 			r.Claims.UserID, r.Claims.Username, r.Claims.PreferredUsername,
 			r.Claims.Email, r.Claims.EmailVerified,
-			encoder(r.Claims.Groups),
+			encoder(r.Claims.Groups), encoder(r.Claims.Custom),
 			r.ConnectorID, r.ConnectorData,
 			r.Token, r.CreatedAt, r.LastUsed, id,
 		)
@@ -358,7 +393,7 @@ func getRefresh(q querier, id string) (storage.RefreshToken, error) {
 			id, client_id, scopes, nonce,
 			claims_user_id, claims_username, claims_preferred_username,
 			claims_email, claims_email_verified,
-			claims_groups,
+			claims_groups, claims_custom,
 			connector_id, connector_data,
 			token, created_at, last_used
 		from refresh_token where id = $1;
@@ -370,7 +405,7 @@ func (c *conn) ListRefreshTokens() ([]storage.RefreshToken, error) {
 		select
 			id, client_id, scopes, nonce,
 			claims_user_id, claims_username, claims_preferred_username,
-			claims_email, claims_email_verified, claims_groups,
+			claims_email, claims_email_verified, claims_groups, claims_custom,
 			connector_id, connector_data,
 			token, created_at, last_used
 		from refresh_token;
@@ -400,6 +435,7 @@ func scanRefresh(s scanner) (r storage.RefreshToken, err error) {
 		&r.Claims.UserID, &r.Claims.Username, &r.Claims.PreferredUsername,
 		&r.Claims.Email, &r.Claims.EmailVerified,
 		decoder(&r.Claims.Groups),
+		defaultDecoder(&r.Claims.Custom, []byte("{}")),
 		&r.ConnectorID, &r.ConnectorData,
 		&r.Token, &r.CreatedAt, &r.LastUsed,
 	)
@@ -759,7 +795,8 @@ func scanOfflineSessions(s scanner) (o storage.OfflineSessions, err error) {
 }
 
 func (c *conn) CreateConnector(connector storage.Connector) error {
-	_, err := c.Exec(`
+	return c.ExecTx(func(tx *trans) error {
+		_, err := tx.Exec(`
 		insert into connector (
 			id, type, name, resource_version, config
 		)
@@ -767,15 +804,34 @@ func (c *conn) CreateConnector(connector storage.Connector) error {
 			$1, $2, $3, $4, $5
 		);
 	`,
-		connector.ID, connector.Type, connector.Name, connector.ResourceVersion, connector.Config,
-	)
-	if err != nil {
-		if c.alreadyExistsCheck(err) {
-			return storage.ErrAlreadyExists
+			connector.ID, connector.Type, connector.Name, connector.ResourceVersion, connector.Config,
+		)
+		if err != nil {
+			if c.alreadyExistsCheck(err) {
+				return storage.ErrAlreadyExists
+			}
+			return fmt.Errorf("insert connector: %v", err)
 		}
-		return fmt.Errorf("insert connector: %v", err)
-	}
-	return nil
+
+		for n, mware := range connector.Middleware {
+			_, err := tx.Exec(`
+		        insert into middleware (
+        		    conn_id, mw_order, type, resource_version, config
+		        )
+		        values (
+		            $1, $2, $3, $4, $5
+		        );
+		    `,
+				connector.ID, n,
+				mware.Type, mware.ResourceVersion, mware.Config,
+			)
+			if err != nil {
+				return fmt.Errorf("create connector insert middleware: %v", err)
+			}
+		}
+
+		return nil
+	})
 }
 
 func (c *conn) UpdateConnector(id string, updater func(s storage.Connector) (storage.Connector, error)) error {
@@ -803,21 +859,112 @@ func (c *conn) UpdateConnector(id string, updater func(s storage.Connector) (sto
 		if err != nil {
 			return fmt.Errorf("update connector: %v", err)
 		}
+
+		// Delete extra middleware entries
+		_, err = tx.Exec(`
+            delete from middleware where conn_id = $1 and mw_order >= $2;
+        `,
+			id, len(newConn.Middleware),
+		)
+		if err != nil {
+			return fmt.Errorf("update connector delete middleware: %v", err)
+		}
+
+		for n, mware := range newConn.Middleware {
+			if n < len(connector.Middleware) {
+				// Update the existing record
+				_, err := tx.Exec(`
+					update middleware
+					set
+						type = $1,
+						resource_version = $2,
+						config = $3
+					where conn_id = $4 and mw_order = $5;
+				`,
+					mware.Type,
+					mware.ResourceVersion,
+					mware.Config,
+					id,
+					n)
+				if err != nil {
+					return fmt.Errorf("update connector middleware: %v", err)
+				}
+			} else {
+				// Insert a new record
+				_, err := tx.Exec(`
+					insert into middleware (
+						conn_id, mw_order, type, resource_version, config
+					)
+					values (
+						$1, $2, $3, $4, $5
+					);
+				`,
+					id, n, mware.Type, mware.ResourceVersion, mware.Config,
+				)
+				if err != nil {
+					return fmt.Errorf("update connector add middleware: %v", err)
+				}
+			}
+		}
+
 		return nil
 	})
 }
 
-func (c *conn) GetConnector(id string) (storage.Connector, error) {
-	return getConnector(c, id)
+func (c *conn) GetConnector(id string) (conn storage.Connector, err error) {
+	err = c.ExecTx(func(tx *trans) error {
+		conn, err = getConnector(tx, id)
+		return err
+	})
+	return conn, err
 }
 
-func getConnector(q querier, id string) (storage.Connector, error) {
-	return scanConnector(q.QueryRow(`
+func getConnector(tx *trans, id string) (storage.Connector, error) {
+	conn, err := scanConnector(tx.QueryRow(`
 		select
 			id, type, name, resource_version, config
 		from connector
 		where id = $1;
 		`, id))
+	if err != nil {
+		return storage.Connector{}, err
+	}
+
+	conn.Middleware, err = getConnectorMiddleware(tx, id)
+	if err != nil {
+		return storage.Connector{}, err
+	}
+
+	return conn, nil
+}
+
+func getConnectorMiddleware(q querier, id string) ([]storage.Middleware, error) {
+	rows, err := q.Query(`
+        select
+            type, resource_version, config
+        from middleware
+        where conn_id = $1
+        order by mw_order asc;
+        `, id)
+	if err != nil {
+		return []storage.Middleware{}, err
+	}
+	defer rows.Close()
+
+	middleware := []storage.Middleware{}
+	for rows.Next() {
+		mware, err := scanMiddleware(rows)
+		if err != nil {
+			return []storage.Middleware{}, err
+		}
+
+		middleware = append(middleware, mware)
+	}
+	if err := rows.Err(); err != nil {
+		return []storage.Middleware{}, err
+	}
+
+	return middleware, nil
 }
 
 func scanConnector(s scanner) (c storage.Connector, err error) {
@@ -834,28 +981,398 @@ func scanConnector(s scanner) (c storage.Connector, err error) {
 }
 
 func (c *conn) ListConnectors() ([]storage.Connector, error) {
-	rows, err := c.Query(`
-		select
-			id, type, name, resource_version, config
-		from connector;
-	`)
+	var connectors []storage.Connector
+
+	err := c.ExecTx(func(tx *trans) error {
+		rows, err := tx.Query(`
+			select
+				id, type, name, resource_version, config
+			from connector;
+		`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			conn, err := scanConnector(rows)
+			if err != nil {
+				return err
+			}
+
+			connectors = append(connectors, conn)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		// Have to do this after reading all the rows (otherwise we'd need to
+		// use a cursor).
+		for _, conn := range connectors {
+			conn.Middleware, err = getConnectorMiddleware(tx, conn.ID)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
+
+	return connectors, nil
+}
+
+func (c *conn) DeleteConnector(id string) error {
+	return c.ExecTx(func(tx *trans) error {
+		_, err := tx.Exec(`
+			delete from middleware where conn_id = $1;
+		`,
+			id)
+		if err != nil {
+			return fmt.Errorf("delete connector middleware: %v", err)
+		}
+
+		result, err := tx.Exec(`
+			delete from connector where id = $1;
+		`,
+			id)
+		if err != nil {
+			return fmt.Errorf("delete connector: %v", err)
+		}
+
+		// For now mandate that the driver implements RowsAffected. If we ever need to support
+		// a driver that doesn't implement this, we can run this in a transaction with a get beforehand.
+		n, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("rows affected: %v", err)
+		}
+		if n < 1 {
+			return storage.ErrNotFound
+		}
+		return nil
+	})
+}
+
+func (c *conn) InsertMiddleware(ndx int, mware storage.Middleware) error {
+	return c.ExecTx(func(tx *trans) error {
+		var order int64
+
+		switch ndx {
+		case 0:
+			var maybeOrder sql.NullInt64
+			err := tx.QueryRow(`
+				select MIN(mw_order) from middleware where conn_id = '';
+			`).Scan(&maybeOrder)
+			if err != nil {
+				return fmt.Errorf("insert middleware find min: %v", err)
+			}
+
+			if maybeOrder.Valid {
+				order = maybeOrder.Int64
+
+				// We rely on this in the renumber routine; without it,
+				// order might not be unique when doing a renumber
+				if order == 0 {
+					order, err = renumberMiddleware(0, tx)
+					if err != nil {
+						return err
+					}
+				}
+
+				order /= 2
+			} else {
+				order = orderStep
+			}
+		case -1:
+			var maybeOrder sql.NullInt64
+			err := tx.QueryRow(`
+				select MAX(mw_order) from middleware where conn_id = '';
+			`).Scan(&maybeOrder)
+			if err != nil {
+				return fmt.Errorf("insert middleware find max: %v", err)
+			}
+
+			if maybeOrder.Valid {
+				order = maybeOrder.Int64 + orderStep
+			} else {
+				order = orderStep
+			}
+		default:
+			err := func() error {
+				rows, err := tx.Query(`
+					select
+						mw_order
+					from middleware
+					where conn_id = ''
+					order by mw_order asc
+					limit 2 offset $1
+				`, ndx)
+				if err != nil {
+					return fmt.Errorf("insert middleware find low/high: %v", err)
+				}
+				defer rows.Close()
+
+				if !rows.Next() {
+					return storage.ErrOutOfRange
+				}
+
+				var low int64
+				err = rows.Scan(&low)
+				if err != nil {
+					return fmt.Errorf("insert middleware scan low: %v", err)
+				}
+
+				if !rows.Next() {
+					order = low + 1024
+				} else {
+					var high int64
+					err = rows.Scan(&high)
+					if err != nil {
+						return fmt.Errorf("insert middleware scan high: %v", err)
+					}
+
+					if high == low+1 {
+						order, err = renumberMiddleware(ndx, tx)
+						if err != nil {
+							return err
+						}
+						order += orderStep / 2
+					} else {
+						order = low + (high-low)/2
+					}
+				}
+
+				if err := rows.Err(); err != nil {
+					return fmt.Errorf("insert middleware find low/high err: %v", err)
+				}
+
+				return nil
+			}()
+			if err != nil {
+				return err
+			}
+		}
+
+		_, err := tx.Exec(`
+        	insert into middleware (
+            	conn_id, type, mw_order, resource_version, config
+        	)
+	        values (
+    	        '', $1, $2, $3, $4
+        	);
+    	`,
+			mware.Type, order, mware.ResourceVersion, mware.Config,
+		)
+		if err != nil {
+			return fmt.Errorf("insert middleware: %v", err)
+		}
+
+		return nil
+	})
+}
+
+func renumberMiddleware(ndx int, tx *trans) (int64, error) {
+	rows, err := tx.Query(`
+		select mw_order from middleware where conn_id = '' order by mw_order asc;
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("renumber middleware: %v", err)
+	}
 	defer rows.Close()
 
-	var connectors []storage.Connector
+	// The idea here is that since we know the minimum possible order is 0,
+	// and since the smallest it can increment by is 1, we can renumber the
+	// middleware entries as 0, 1, 2, 3, 4, 5, ... without having to worry
+	// that one of these numbers is in use already.
+	result := int64(0)
+	n := int64(0)
 	for rows.Next() {
-		conn, err := scanConnector(rows)
+		var order int64
+		err = rows.Scan(&order)
 		if err != nil {
-			return nil, err
+			return result, fmt.Errorf("renumber middleware scan: %v", err)
 		}
-		connectors = append(connectors, conn)
+
+		_, err = tx.Exec(`
+			update middleware set mw_order = $1 where conn_id = '' and mw_order = $3;
+		`,
+			n,
+			order)
+		if err != nil {
+			return result, fmt.Errorf("renumber middleware update: %v", err)
+		}
+
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return result, fmt.Errorf("renumber middleware: %v", err)
 	}
-	return connectors, nil
+
+	// Once we've done that step, update the order to go up in the step size
+	// increments rather than by ones.
+	_, err = tx.Exec(`
+		update middleware set mw_order = (mw_order + 1) * $1 where conn_id = '';
+    `,
+		orderStep,
+	)
+	if err != nil {
+		return result, fmt.Errorf("renumber middleware multiply: %v", err)
+	}
+
+	return int64(ndx) * orderStep, nil
+}
+
+func (c *conn) UpdateMiddleware(ndx int, updater func(m storage.Middleware) (storage.Middleware, error)) error {
+	return c.ExecTx(func(tx *trans) error {
+		var order int64
+
+		// Find the order value for this index
+		err := tx.QueryRow(`
+			select
+				mw_order
+			from middleware
+			where conn_id = ''
+			order by mw_order asc
+			limit 1 offset $1;
+		`,
+			ndx,
+		).Scan(&order)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return storage.ErrOutOfRange
+			}
+			return fmt.Errorf("update middleware find index: %v", err)
+		}
+
+		middleware, err := scanMiddleware(tx.QueryRow(`
+        	select
+            	type, resource_version, config
+	        from middleware
+	        where conn_id = '' and mw_order = $1;
+        `, order))
+		if err != nil {
+			return err
+		}
+
+		newMware, err := updater(middleware)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec(`
+			update middleware
+			set
+				type = $1,
+				resource_version = $2,
+				config = $3
+			where conn_id = '' and mw_order = $4;
+		`,
+			newMware.Type,
+			newMware.ResourceVersion,
+			newMware.Config,
+			order,
+		)
+		if err != nil {
+			return fmt.Errorf("update middleware: %v", err)
+		}
+
+		return nil
+	})
+}
+
+func (c *conn) GetMiddleware(ndx int) (storage.Middleware, error) {
+	row := c.QueryRow(`
+		select
+			type, resource_version, config
+		from middleware
+		where conn_id = ''
+		order by mw_order asc
+		limit 1 offset $1;
+	`, ndx)
+
+	mware, err := scanMiddleware(row)
+	if err != nil {
+		return storage.Middleware{}, err
+	}
+
+	return mware, nil
+}
+
+func (c *conn) ListMiddleware() ([]storage.Middleware, error) {
+	var middleware []storage.Middleware
+
+	rows, err := c.Query(`
+		select
+			type, resource_version, config
+		from middleware
+		where conn_id = ''
+		order by mw_order asc;
+	`)
+	if err != nil {
+		return []storage.Middleware{}, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		mware, err := scanMiddleware(rows)
+		if err != nil {
+			return []storage.Middleware{}, err
+		}
+
+		middleware = append(middleware, mware)
+	}
+	if err := rows.Err(); err != nil {
+		return []storage.Middleware{}, err
+	}
+
+	return middleware, nil
+}
+
+func scanMiddleware(s scanner) (m storage.Middleware, err error) {
+	err = s.Scan(
+		&m.Type, &m.ResourceVersion, &m.Config,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return m, storage.ErrOutOfRange
+		}
+		return m, fmt.Errorf("select middleware: %v", err)
+	}
+	return m, nil
+}
+
+func (c *conn) DeleteMiddleware(ndx int) error {
+	return c.ExecTx(func(tx *trans) error {
+		var maybeOrder sql.NullInt64
+		err := tx.QueryRow(`
+			select mw_order from middleware where conn_id = ''
+			order by mw_order asc
+			limit 1 offset $1;
+		`, ndx).Scan(&maybeOrder)
+		if err != nil {
+			return fmt.Errorf("delete middleware find order: %v", err)
+		}
+
+		if !maybeOrder.Valid {
+			return storage.ErrOutOfRange
+		}
+
+		order := maybeOrder.Int64
+
+		_, err = tx.Exec(`
+			delete from middleware
+			where conn_id = '' and mw_order = $1;
+		`,
+			order,
+		)
+		if err != nil {
+			return fmt.Errorf("delete middleware: %v", err)
+		}
+
+		return nil
+	})
 }
 
 func (c *conn) DeleteAuthRequest(id string) error { return c.delete("auth_request", "id", id) }
@@ -865,7 +1382,6 @@ func (c *conn) DeleteRefresh(id string) error     { return c.delete("refresh_tok
 func (c *conn) DeletePassword(email string) error {
 	return c.delete("password", "email", strings.ToLower(email))
 }
-func (c *conn) DeleteConnector(id string) error { return c.delete("connector", "id", id) }
 
 func (c *conn) DeleteOfflineSessions(userID string, connID string) error {
 	result, err := c.Exec(`delete from offline_session where user_id = $1 AND conn_id = $2`, userID, connID)
@@ -998,7 +1514,7 @@ func (c *conn) UpdateDeviceToken(deviceCode string, updater func(old storage.Dev
 		_, err = tx.Exec(`
 			update device_token
 			set
-				status = $1, 
+				status = $1,
 				token = $2,
 				last_request = $3,
 				poll_interval = $4
