@@ -31,6 +31,9 @@ import (
 //       rootCA: /etc/dex/ldap.ca
 //       bindDN: uid=serviceaccount,cn=users,dc=example,dc=com
 //       bindPW: password
+//       # for ldap simple bind mode.
+//       bindDNPrefix: uid=
+//       bindDNSuffix: ,cn=users,dc=example,dc=com
 //       userSearch:
 //         # Would translate to the query "(&(objectClass=person)(uid=<username>))"
 //         baseDN: cn=users,dc=example,dc=com
@@ -92,6 +95,11 @@ type Config struct {
 	// credentials to search for users and groups.
 	BindDN string `json:"bindDN"`
 	BindPW string `json:"bindPW"`
+
+	// BindDNPrefix and BindDNSuffix for LDAP Simple bind mode.
+	// The connector uses BindDNPrefix username BindDNSuffix as bind username.
+	BindDNPrefix string `json:"bindDNPrefix"`
+	BindDNSuffix string `json:"bindDNSuffix"`
 
 	// UsernamePrompt allows users to override the username attribute (displayed
 	// in the username/password prompt). If unset, the handler will use
@@ -283,7 +291,7 @@ func (c *Config) openConnector(logger log.Logger) (*ldapConnector, error) {
 	if !ok {
 		return nil, fmt.Errorf("groupSearch.Scope unknown value %q", c.GroupSearch.Scope)
 	}
-	return &ldapConnector{*c, userSearchScope, groupSearchScope, tlsConfig, logger}, nil
+	return &ldapConnector{*c, userSearchScope, groupSearchScope, tlsConfig, logger, "", []byte{}}, nil
 }
 
 type ldapConnector struct {
@@ -295,6 +303,9 @@ type ldapConnector struct {
 	tlsConfig *tls.Config
 
 	logger log.Logger
+
+	uid  string
+	pass []byte
 }
 
 var (
@@ -330,12 +341,26 @@ func (c *ldapConnector) do(_ context.Context, f func(c *ldap.Conn) error) error 
 	}
 	defer conn.Close()
 
+	var (
+		bindDN string
+		bindPW string
+	)
+	bindDN = c.BindDN
+	bindPW = c.BindPW
+
+	if c.BindDNPrefix != "" || c.BindDNSuffix != "" {
+		bindDN = fmt.Sprintf("%s%s%s", c.BindDNPrefix, c.uid, c.BindDNSuffix)
+		bindPW = string(c.pass)
+	}
+
+	c.logger.Debugf("ldap: - bindDN=<%s>", bindDN)
+
 	// If bindDN and bindPW are empty this will default to an anonymous bind.
-	if err := conn.Bind(c.BindDN, c.BindPW); err != nil {
-		if c.BindDN == "" && c.BindPW == "" {
+	if err := conn.Bind(bindDN, bindPW); err != nil {
+		if bindDN == "" && bindPW == "" {
 			return fmt.Errorf("ldap: initial anonymous bind failed: %v", err)
 		}
-		return fmt.Errorf("ldap: initial bind for user %q failed: %v", c.BindDN, err)
+		return fmt.Errorf("ldap: initial bind for user %q failed: %v", bindDN, err)
 	}
 
 	return f(conn)
@@ -450,6 +475,9 @@ func (c *ldapConnector) userEntry(conn *ldap.Conn, username string) (user ldap.E
 }
 
 func (c *ldapConnector) Login(ctx context.Context, s connector.Scopes, username, password string) (ident connector.Identity, validPass bool, err error) {
+	c.uid = username
+	c.pass = []byte(password)
+
 	// make this check to avoid unauthenticated bind to the LDAP server.
 	if password == "" {
 		return connector.Identity{}, false, nil
