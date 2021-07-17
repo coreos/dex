@@ -99,6 +99,7 @@ func runServe(options serveOptions) error {
 		return err
 	}
 
+	c.Issuer = os.ExpandEnv(c.Issuer)
 	logger.Infof("config issuer: %s", c.Issuer)
 
 	prometheusRegistry := prometheus.NewRegistry()
